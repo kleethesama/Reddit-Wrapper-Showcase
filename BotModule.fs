@@ -1,13 +1,13 @@
 module botModule
 
 open System
-open System.IO
-open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
 open System.Net.Http
 open System.Net.Http.Headers
-open botInfo // Used solely to hide sensitive information, like the bot's username, password, etc.
+open botInfo
+open httpTasks
+open Io
 
 (*
   How data is structered when recieved by requests:
@@ -18,28 +18,6 @@ open botInfo // Used solely to hide sensitive information, like the bot's userna
   For example, list[0]["title"] contains the title of the first post in the list, where list[0]["author"] would be the user who created that post.
 *)
 
-let client = new HttpClient()
-
-client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", userInfo.["User-Agent"])
-
-let constructHttpRequest (method : string) (uri : string) =
-  new HttpRequestMessage(new HttpMethod(method), uri)
-
-let constructEncodedContent (content : Map<string, string>) =
-  new FormUrlEncodedContent(content)
-
-let setHttpRequestMessageContent (httpRequest : HttpRequestMessage) (httpContent : FormUrlEncodedContent) =
-  httpRequest.Content <- httpContent
-  httpRequest
-
-let stringToBase64 (s : string) =
-  let Encoder = UTF8Encoding()
-  let bytesFromString = Encoder.GetBytes(s)
-  Convert.ToBase64String(bytesFromString)
-
-let constructAuthenticationHeaderValue (scheme : string) (credentials : string) =
-  new AuthenticationHeaderValue(scheme, credentials |> stringToBase64)
-
 let getRedditAccessToken (postData : Map<string, string>) (ID : string) (secret : string) =
   let request = (constructHttpRequest "POST" "https://www.reddit.com/api/v1/access_token", constructEncodedContent postData) ||> setHttpRequestMessageContent
   request.Headers.Authorization <- ("Basic", $"{ID}:{secret}") ||> constructAuthenticationHeaderValue
@@ -48,40 +26,13 @@ let getRedditAccessToken (postData : Map<string, string>) (ID : string) (secret 
     return response.Content
   }
 
-let getStringFromContent (content : HttpContent) =
-  task {
-    return! content.ReadAsStringAsync()
-  }
-
 let constructJsonNode (s : string) =
   let mutable OPTION = new JsonDocumentOptions()
   OPTION.MaxDepth <- 64
   JsonNode.Parse(s, documentOptions=OPTION)
 
-let createTextFile (path : string) (s : string) =
-  task {
-    return! File.WriteAllTextAsync(path, s)
-  }
-(*
-let truncateTextFile (path : string) (s : string) =
-  let ENCODER = new UnicodeEncoding()
-  let STREAM = new FileStream(path, FileMode.Truncate, FileAccess.ReadWrite)
-  task {
-    return! STREAM.WriteAsync(ENCODER.GetBytes(s))
-  }
-*)
-let readTextFile (path : string) =
-  task {
-    return! File.ReadAllTextAsync(path)
-  }
-
 let setAccessToken (s : string) =
   client.DefaultRequestHeaders.Authorization <- new AuthenticationHeaderValue("Bearer", s)
-
-let checkResponse (message : HttpResponseMessage) =
-  match message with
-  | message when message.IsSuccessStatusCode -> true
-  | _ -> false
 
 let checkRateLimit (message : HttpResponseMessage) =
   let HEADERS = message.Headers.GetValues("x-ratelimit-remaining") |> Seq.exactlyOne
@@ -102,30 +53,9 @@ let saveNewAccessToken (responseCheck : bool) =
     let WRITE = ("access_token.txt", TOKEN) ||> createTextFile
     TOKEN |> setAccessToken
     WRITE.Wait()
-    printfn "New access token acquired, written to file, and set on header!"
     false
 
 let responseChecker = checkResponse >> saveNewAccessToken
-
-let postAsyncRequest (uri : string) (content : Map<string, string>) =
-  task {
-    try
-      return! client.PostAsync(uri, content |> constructEncodedContent)
-    with
-      | :? HttpRequestException as e ->
-        printfn $"Request failed:\n{e.Message}"
-        return new HttpResponseMessage(e.StatusCode.GetValueOrDefault())
-  }
-
-let getAsyncRequest (uri : string) (content : Map<string, string>) =
-  task {
-    try
-      return! client.SendAsync((constructHttpRequest "GET" uri, constructEncodedContent content) ||> setHttpRequestMessageContent)
-    with
-      | :? HttpRequestException as e ->
-        printfn $"Request failed:\n{e.Message}"
-        return new HttpResponseMessage(e.StatusCode.GetValueOrDefault())
-  }
 
 let AttemptLoop (uri : string) (method : string) (content : Map<string, string>) =
   let ARGCHECK =
@@ -152,10 +82,6 @@ let AttemptLoop (uri : string) (method : string) (content : Map<string, string>)
       | false -> loop n REQUEST.Result
       | _ -> failwith $"Something unexpected happened! Perhaps an x-ratelimit?:\n{REQUEST.Result}"
   loop 1 (new HttpResponseMessage())
-
-let readHttpContent (response : HttpResponseMessage) =
-  let READ = response.Content |> getStringFromContent
-  READ.Result
 
 let responseToJsonNode (response : HttpResponseMessage) =
   response |> readHttpContent |> constructJsonNode
@@ -194,7 +120,7 @@ let putFilteredDataIntoList (sequ : seq<JsonNode>) (nodesToBeIncluded : string l
 let sendPrivateMessage (subject : string) (text : string) (recipient : string) =
   AttemptLoop "https://oauth.reddit.com/api/compose" "POST" (Map [("subject", $"{subject}"); ("text", $"{text}"); ("to", $"{recipient}")])
 
-let postsFromSubreddit (subreddit : string) (sortMethod : string) (nsfw : bool) (limit : int) =
+let postsFromSubredditOrUser (subreddit : string) (sortMethod : string) (nsfw : bool) (limit : int) (after : string) =
   let ARGCHECK =
     match sortMethod with
     | "new" -> ()
@@ -204,9 +130,13 @@ let postsFromSubreddit (subreddit : string) (sortMethod : string) (nsfw : bool) 
     match nsfw with
     | true -> 1
     | false -> 0
+  let afterCHECK =
+    match after with
+    | "" -> ""
+    | _ -> $"&after={after}"
   match limit with
   | limit when limit > 100 || limit <= 0 -> failwith $"""Limit value {limit} is invalid! It has to be either "hot" or "new"."""
-  | _ -> AttemptLoop ("https://oauth.reddit.com/r/" + $"{subreddit}/{sortMethod}?limit={limit}&include_over_18={NSFWCHECK}") "GET" (Map [("", "")])
+  | _ -> AttemptLoop ("https://oauth.reddit.com/" + $"{subreddit}/{sortMethod}?limit={limit}&include_over_18={NSFWCHECK}" + afterCHECK) "GET" (Map [("", "")])
 
 let containsString (contains : string) (s : string) =
   s.Contains(contains)
@@ -217,10 +147,44 @@ let keyContainsValue (key : string) (keyword : string) (map : Map<string, string
 let mapContainsValue (keyword : string) (map : Map<string, string>) =
   Map.values map |> Seq.findIndex (fun i -> i |> containsString keyword)
 
-let requestParseAndFilter subreddit sortMethod nsfw limit nodesToBeIncluded =
-  (postsFromSubreddit subreddit sortMethod nsfw limit |> redditParser, nodesToBeIncluded) ||> putFilteredDataIntoList
+let requestParseAndFilter subreddit sortMethod nsfw limit nodesToBeIncluded after =
+  (postsFromSubredditOrUser subreddit sortMethod nsfw limit after |> redditParser, nodesToBeIncluded) ||> putFilteredDataIntoList
+
+let requestParseAndFilterPoly subreddit sortMethod nsfw nodesToBeIncluded (nPages : int) =
+  let ARGCHECK = nodesToBeIncluded |> List.contains "name"
+  match ARGCHECK with
+  | false -> failwith """The required "NAME" string was not included in the list argument."""
+  | true ->
+    let rec loop n s l =
+      let posts = requestParseAndFilter subreddit sortMethod nsfw 100 nodesToBeIncluded s
+      match n with
+      | n when n = nPages -> l
+      | _ ->
+        try
+          loop (n + 1) ((posts |> List.last)["name"]) (l @ posts)
+        with
+          | :? ArgumentException as e -> l
+    loop 0 "" []
+
+let convertTimeFromPost (s : string) =
+  let TIME = new DateTimeOffset(DateTime.UtcNow)
+  let POST_TIME = s |> Convert.ToDouble |> fun i -> i / 10.0 |> Convert.ToInt64 |> DateTimeOffset.FromUnixTimeSeconds |> TIME.Subtract
+  POST_TIME.ToString()
+
+let insertPostTimes (l : Map<string, string> list) =
+  let f = fun i ->
+    match i with
+    | Some i -> Some (i |> convertTimeFromPost)
+    | None -> None
+  let rec loop k m =
+    match k with
+    | [] -> m
+    | x::xs -> (loop xs) (m @ [x |> Map.change "created_utc" f])
+  loop l []
+
+let subredditGetPostsAndTimeFiltered subreddit sortMethod nsfw nodesToBeIncluded nPages =
+  requestParseAndFilterPoly subreddit sortMethod nsfw nodesToBeIncluded nPages |> insertPostTimes
 
 let initializeBot () =
   let READ = readTextFile "access_token.txt"
   setAccessToken READ.Result
-  printfn $"The access token has been successfully set to {READ.Result}"
